@@ -24,20 +24,47 @@ function parseMemberSuffix(value: string): number | null {
 async function generateMemberNumber(): Promise<string> {
   const { data, error } = await supabase
     .from('loyalty_members')
-    .select('member_number')
-    .order('member_number', { ascending: false })
-    .limit(200);
+    .select('id,member_number')
+    .order('id', { ascending: false })
+    .limit(1)
+    .maybeSingle();
   if (error) throw error;
 
-  let maxSuffix = 2024000;
-  for (const row of data || []) {
-    const suffix = parseMemberSuffix(String((row as any).member_number || ''));
-    if (suffix !== null && suffix > maxSuffix) {
-      maxSuffix = suffix;
+  const suffix = parseMemberSuffix(String((data as any)?.member_number || ''));
+  const base = Math.max(2024000, suffix ?? 2024000);
+  return `ZUS${base + 1}`;
+}
+
+async function createMemberWithRetry(payload: {
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+  points_balance: number;
+  tier: string;
+}) {
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const memberNumber = await generateMemberNumber();
+    const result = await supabase
+      .from('loyalty_members')
+      .insert([{ ...payload, member_number: memberNumber }])
+      .select()
+      .single();
+
+    if (!result.error) return result.data;
+
+    lastError = result.error;
+    const conflictOnMemberNumber =
+      result.error.code === '23505' && String(result.error.message || '').toLowerCase().includes('member_number');
+
+    if (!conflictOnMemberNumber) {
+      throw result.error;
     }
   }
 
-  return `ZUS${maxSuffix + 1}`;
+  throw lastError ?? new Error('Failed to allocate unique member number.');
 }
 
 export function RegistrationCard() {
@@ -85,26 +112,14 @@ export function RegistrationCard() {
 
       // SCRUM-15 (Create member registration API): Using a serverless architecture. This Supabase client-side SDK handles the direct, secure database insertion, replacing the need for a traditional Express routing layer.
       // Direct database insert to loyalty_members (SCRUM-47)
-      const memberNumber = await generateMemberNumber();
-      const { data: newMember, error: insertError } = await supabase
-        .from('loyalty_members')
-        .insert([
-          {
-            member_number: memberNumber,
-            first_name: formData.firstName,
-            last_name: formData.lastName,
-            email: formData.email,
-            phone: formData.phone,
-            points_balance: 0,
-            tier: 'Bronze',
-          },
-        ])
-        .select()
-        .single();
-
-      if (insertError) {
-        throw insertError;
-      }
+      const newMember = await createMemberWithRetry({
+        first_name: formData.firstName,
+        last_name: formData.lastName,
+        email: formData.email,
+        phone: formData.phone,
+        points_balance: 0,
+        tier: 'Bronze',
+      });
 
       const welcomeResult = await ensureWelcomePackage(newMember.member_number, newMember.email);
       const memberPointsBalance = Number(welcomeResult.newBalance ?? newMember.points_balance ?? 0);
