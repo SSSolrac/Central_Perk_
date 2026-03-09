@@ -5,6 +5,64 @@ import { createClient } from "npm:@supabase/supabase-js@2";
 
 const app = new Hono();
 
+function parseMemberSuffix(value: string): number | null {
+  if (!value) return null;
+  const match = value.match(/(\d+)$/);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function generateMemberNumber() {
+  const { data, error } = await supabase
+    .from('loyalty_members')
+    .select('id,member_number')
+    .order('id', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  const suffix = parseMemberSuffix(String(data?.member_number || ''));
+  const base = Math.max(2024000, suffix ?? 2024000);
+  return `ZUS${base + 1}`;
+}
+
+async function insertMemberWithRetry(payload: {
+  first_name: string;
+  last_name: string;
+  email: string;
+  phone: string;
+}) {
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const memberNumber = await generateMemberNumber();
+    const result = await supabase
+      .from('loyalty_members')
+      .insert([{ ...payload, member_number: memberNumber }])
+      .select()
+      .single();
+
+    if (!result.error) {
+      return { data: result.data, error: null };
+    }
+
+    lastError = result.error;
+    const conflictOnMemberNumber =
+      result.error.code === '23505' && String(result.error.message || '').toLowerCase().includes('member_number');
+
+    if (!conflictOnMemberNumber) {
+      return { data: null, error: result.error };
+    }
+  }
+
+  return {
+    data: null,
+    error: lastError ?? new Error('Failed to allocate unique member number.'),
+  };
+}
+
 // Create Supabase client
 const supabase = createClient(
   Deno.env.get('SUPABASE_URL') ?? '',
@@ -80,18 +138,12 @@ app.post("/make-server-3424be34/register", async (c) => {
     }
 
     // Insert into loyalty_members table
-    const { data: memberData, error: insertError } = await supabase
-      .from('loyalty_members')
-      .insert([
-        {
-          first_name: firstName,
-          last_name: lastName,
-          email: email,
-          phone: phone,
-        }
-      ])
-      .select()
-      .single();
+    const { data: memberData, error: insertError } = await insertMemberWithRetry({
+      first_name: firstName,
+      last_name: lastName,
+      email: email,
+      phone: phone,
+    });
 
     if (insertError) {
       console.error("Error inserting member:", insertError);
@@ -159,18 +211,12 @@ app.post("/make-server-3424be34/register-member", async (c) => {
     }
 
     // Insert into loyalty_members table
-    const { data, error } = await supabase
-      .from('loyalty_members')
-      .insert([
-        {
-          first_name: firstName,
-          last_name: lastName,
-          email: email,
-          phone: phone,
-        }
-      ])
-      .select()
-      .single();
+    const { data, error } = await insertMemberWithRetry({
+      first_name: firstName,
+      last_name: lastName,
+      email: email,
+      phone: phone,
+    });
 
     if (error) {
       console.error("Error inserting member:", error);
